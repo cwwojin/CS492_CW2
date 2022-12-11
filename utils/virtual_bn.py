@@ -1,91 +1,69 @@
 import torch
 import torch.nn as nn
+from torch.autograd import Variable
+from torch.nn.parameter import Parameter
+from torch.nn.modules import Module
 
+"""
+1-dimensional VBN (for FC-layers)
+"""
 
-class VirtualBatchNorm(nn.Module):
-    r"""Virtual Batch Normalization Module as proposed in the paper
-    `"Improved Techniques for Training GANs by Salimans et. al." <https://arxiv.org/abs/1805.08318>`_
+class VirtualBatchNorm1d(Module):
+    def __init__(self, num_features: int, eps: float=1e-5):
+        super().__init__()
+        # batch statistics
+        self.num_features = num_features
+        self.eps = eps  # epsilon
+        self.ref_mean = self.register_parameter('ref_mean', None)
+        self.ref_mean_sq = self.register_parameter('ref_mean_sq', None)
 
-    Performs Normalizes the features of a batch based on the statistics collected on a reference
-    batch of samples that are chosen once and fixed from the start, as opposed to regular
-    batch normalization that uses the statistics of the batch being normalized
+        # define gamma and beta parameters
+        gamma = torch.normal(mean=torch.ones(1, num_features, 1), std=0.02)
+        self.gamma = Parameter(gamma.float().cuda(async=True))
+        self.beta = Parameter(torch.cuda.FloatTensor(1, num_features, 1).fill_(0))
 
-    Virtual Batch Normalization requires that the size of the batch being normalized is at least
-    a multiple of (and ideally equal to) the size of the reference batch. Keep this in mind while
-    choosing the batch size in ```torch.utils.data.DataLoader``` or use ```drop_last=True```
+    def get_stats(self, x):
+        mean = x.mean(2, keepdim=True).mean(0, keepdim=True)
+        mean_sq = (x ** 2).mean(2, keepdim=True).mean(0, keepdim=True)
+        return mean, mean_sq
 
-    .. math:: y = \frac{x - \mathrm{E}[x_{ref}]}{\sqrt{\mathrm{Var}[x_{ref}] + \epsilon}} * \gamma + \beta
-
-    where
-
-    - :math:`x` : Batch Being Normalized
-    - :math:`x_{ref}` : Reference Batch
-
-    Args:
-        in_features (int): Size of the input dimension to be normalized
-        eps (float, optional): Value to be added to variance for numerical stability while normalizing
-    """
-
-    def __init__(self, in_features, eps=1e-5):
-        super(VirtualBatchNorm, self).__init__()
-        self.in_features = in_features
-        self.scale = nn.Parameter(torch.ones(in_features))
-        self.bias = nn.Parameter(torch.zeros(in_features))
-        self.ref_mu = None
-        self.ref_var = None
-        self.eps = eps
-
-    def _batch_stats(self, x):
-        r"""Computes the statistics of the batch ``x``.
-
-        Args:
-            x (torch.Tensor): Tensor whose statistics need to be computed.
-
-        Returns:
-            A tuple of the mean and variance of the batch ``x``.
-        """
-        mu = torch.mean(x, dim=0, keepdim=True)
-        var = torch.var(x, dim=0, keepdim=True)
-        return mu, var
-
-    def _normalize(self, x, mu, var):
-        r"""Normalizes the tensor ``x`` using the statistics ``mu`` and ``var``.
-
-        Args:
-            x (torch.Tensor): The Tensor to be normalized.
-            mu (torch.Tensor): Mean using which the Tensor is to be normalized.
-            var (torch.Tensor): Variance used in the normalization of ``x``.
-
-        Returns:
-            Normalized Tensor ``x``.
-        """
-        std = torch.sqrt(self.eps + var)
-        x = (x - mu) / std
-        sizes = list(x.size())
-        for dim, i in enumerate(x.size()):
-            if dim != 1:
-                sizes[dim] = 1
-        scale = self.scale.view(*sizes)
-        bias = self.bias.view(*sizes)
-        return x * scale + bias
-
-    def forward(self, x):
-        r"""Computes the output of the Virtual Batch Normalization
-
-        Args:
-            x (torch.Tensor): A Torch Tensor of dimension at least 2 which is to be Normalized
-
-        Returns:
-            Torch Tensor of the same dimension after normalizing with respect to the statistics of the reference batch
-        """
-        assert x.size(1) == self.in_features
-        if self.ref_mu is None or self.ref_var is None:
-            self.ref_mu, self.ref_var = self._batch_stats(x)
-            self.ref_mu = self.ref_mu.clone().detach()
-            self.ref_var = self.ref_var.clone().detach()
-            out = self._normalize(x, self.ref_mu, self.ref_var)
+    def forward(self, x, ref_mean: None, ref_mean_sq: None):
+        mean, mean_sq = self.get_stats(x)
+        if ref_mean is None or ref_mean_sq is None:
+            # reference mode - works just like batch norm
+            mean = mean.clone().detach()
+            mean_sq = mean_sq.clone().detach()
+            out = self._normalize(x, mean, mean_sq)
         else:
-            out = self._normalize(x, self.ref_mu, self.ref_var)
-            self.ref_mu = None
-            self.ref_var = None
-        return out
+            # calculate new mean and mean_sq
+            batch_size = x.size(0)
+            new_coeff = 1. / (batch_size + 1.)
+            old_coeff = 1. - new_coeff
+            mean = new_coeff * mean + old_coeff * ref_mean
+            mean_sq = new_coeff * mean_sq + old_coeff * ref_mean_sq
+            out = self._normalize(x, mean, mean_sq)
+        return out, mean, mean_sq
+
+    def _normalize(self, x, mean, mean_sq):
+        assert mean_sq is not None
+        assert mean is not None
+        assert len(x.size()) == 3  # specific for 1d VBN
+        if mean.size(1) != self.num_features:
+            raise Exception(
+                    'Mean size not equal to number of featuers : given {}, expected {}'
+                    .format(mean.size(1), self.num_features))
+        if mean_sq.size(1) != self.num_features:
+            raise Exception(
+                    'Squared mean tensor size not equal to number of features : given {}, expected {}'
+                    .format(mean_sq.size(1), self.num_features))
+
+        std = torch.sqrt(self.eps + mean_sq - mean**2)
+        x = x - mean
+        x = x / std
+        x = x * self.gamma
+        x = x + self.beta
+        return x
+
+    def __repr__(self):
+        return ('{name}(num_features={num_features}, eps={eps}'
+                .format(name=self.__class__.__name__, **self.__dict__))
